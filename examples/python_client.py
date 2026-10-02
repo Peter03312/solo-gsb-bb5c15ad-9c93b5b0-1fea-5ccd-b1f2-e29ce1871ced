@@ -22,7 +22,13 @@
      快照不变）；同原因重放幂等、异因 409、空因 422、不存在 404；
      历史证书（查询/列表/修订影响报告）仍可读并标示撤销状态；
      仅最新签发版本未撤销时窗口有当前可用证书，撤销最新版不退回旧版，
-     再次签发沿用递增版本并成为当前可用证书。
+     再次签发沿用递增版本并成为当前可用证书；
+  9) 展柜移交放行：非空移交单号 + 非空不重复窗口列表登记移交单，逐窗口
+     固化当前合格且未撤销的最新签发证书（标识/版本/结论）；任一窗口
+     不存在 404、缺当前可用证书或结论非合格 409（整单不留记录）、
+     空/重复列表与空单号 422；同单按窗口集合（不计顺序）重放幂等，
+     集合不同 409；查询时引用证书被撤销或出现更新签发版本即整单失效
+     并锁存，后续再签发不恢复。
 """
 from __future__ import annotations
 
@@ -66,10 +72,11 @@ def summary(ev: dict) -> str:
 
 
 def create_window(name, minutes, max_exceed, max_gap):
+    end_hour, end_min = divmod(minutes, 60)
     _, w = call("POST", "/api/v1/windows", {
         "name": name,
         "start_at": "2026-10-01T00:00:00Z",
-        "end_at": f"2026-10-01T00:{minutes:02d}:00Z",
+        "end_at": f"2026-10-01T{end_hour:02d}:{end_min:02d}:00Z",
         "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
         "max_continuous_exceed_seconds": max_exceed,
         "max_sample_interval_seconds": max_gap,
@@ -107,6 +114,15 @@ def revise_rules(wid, rev, *, tmin=18.0, tmax=22.0, max_exceed=300.0, max_gap=60
 
 def revoke_cert(cid, reason):
     return call("POST", f"/api/v1/certificates/{cid}/revocation", {"reason": reason})
+
+
+def register_handover(order_no, window_ids):
+    return call("POST", "/api/v1/handover-orders",
+                {"order_no": order_no, "window_ids": window_ids})
+
+
+def get_handover(order_no):
+    return call("GET", f"/api/v1/handover-orders/{order_no}")
 
 
 def current_certificate(wid):
@@ -491,6 +507,83 @@ def main() -> None:
     assert x3["version"] == 3 and cur["id"] == x3["id"] and cur["revoked"] is False
     old1 = call("GET", f"/api/v1/certificates/{x1['id']}")[1]
     assert old1["version"] == 1 and old1["revoked"] is True
+
+    # ---------- 展柜移交放行 ----------
+    show("展柜移交放行：登记 / 重放 / 查询 / 失效锁存")
+
+    def new_pass_window(name):
+        """建窗口 + 每分钟合格读数（终点覆盖采样）+ 签发合格证书。"""
+        h = create_window(name, 60, max_exceed=300, max_gap=600)
+        for m in range(60):
+            code, _ = submit(h, f"h{m:02d}", 1, m, 20.0)
+            assert code == 201
+        # 终点覆盖采样（恰在 end_at，自身区段时长为 0）
+        code, _ = call("POST", f"/api/v1/windows/{h}/readings", {
+            "reading_id": "h60", "revision": 1,
+            "measured_at": "2026-10-01T01:00:00Z", "temperature": 20.0})
+        assert code == 201
+        cert = call("POST", f"/api/v1/windows/{h}/certificates/issue",
+                    {"note": "移交前首签"})[1]
+        assert cert["verdict"] == "pass" and cert["revoked"] is False
+        return h, cert["id"]
+
+    ha, ca = new_pass_window("移交窗A")
+    hb, cb = new_pass_window("移交窗B")
+    print("合格窗口:", ha, hb, "对应证书:", ca, cb)
+
+    # 登记：顺序 [hb, ha]，明细按登记顺序固化证书标识/版本/结论
+    code, ho = register_handover("HO-PY-001", [hb, ha])
+    print("登记:", code, "effect:", ho["effect"], "valid:", ho["valid"])
+    assert code == 201 and ho["effect"] == "created" and ho["valid"] is True
+    assert [i["window_id"] for i in ho["items"]] == [hb, ha]
+    assert [i["certificate_id"] for i in ho["items"]] == [cb, ca]
+    assert all(i["verdict"] == "pass" for i in ho["items"])
+
+    # 同单同集合重放（顺序不同）-> 幂等，明细顺序不变
+    code, ho2 = register_handover("HO-PY-001", [ha, hb])
+    print("重放（逆序）:", code, "effect:", ho2["effect"],
+          "顺序:", [i["window_id"] for i in ho2["items"]])
+    assert code == 201 and ho2["effect"] == "idempotent"
+    assert [i["window_id"] for i in ho2["items"]] == [hb, ha]
+
+    # 拒绝路径
+    print("空列表:", register_handover("HO-BAD", [])[0],
+          "| 重复:", register_handover("HO-BAD", [ha, ha])[0],
+          "| 空单号:", register_handover("  ", [ha])[0])
+    assert register_handover("HO-BAD", [])[0] == 422
+    assert register_handover("HO-BAD", [ha, ha])[0] == 422
+    assert register_handover("  ", [ha])[0] == 422
+    assert register_handover("HO-404", [99999])[0] == 404
+    # 同单集合不同 -> 409；空窗口无证书 -> 409 且不留记录
+    assert register_handover("HO-PY-001", [ha])[0] == 409
+    he = create_window("移交窗E-空窗", 60, max_exceed=300, max_gap=600)
+    assert register_handover("HO-PY-EMPTY", [he])[0] == 409
+    assert get_handover("HO-PY-EMPTY")[0] == 404
+    print("窗口不存在 404 / 集合不同 409 / 无证书 409 且整单不留记录 ✔")
+
+    # 查询原单：有效
+    code, g = get_handover("HO-PY-001")
+    print("查询:", code, "valid:", g["valid"])
+    assert code == 200 and g["valid"] is True
+
+    # 窗口 ha 再签发新版本 -> 原单失效（引用版本被更新版本取代）
+    call("POST", f"/api/v1/windows/{ha}/certificates/issue", {"note": "v2"})
+    code, g = get_handover("HO-PY-001")
+    print("ha 再签发后 valid:", g["valid"], "（明细版本仍为",
+          [(i["window_id"], i["certificate_version"]) for i in g["items"]], "）")
+    assert code == 200 and g["valid"] is False
+
+    # 撤销 hb 引用的首版证书；失效状态锁存，重放也返回原失效单
+    assert revoke_cert(cb, "移交复核：签发依据有误")[0] == 201
+    code, g = get_handover("HO-PY-001")
+    assert g["valid"] is False
+    code, replay = register_handover("HO-PY-001", [hb, ha])
+    print("撤销后重放: effect:", replay["effect"], "valid:", replay["valid"],
+          "（不恢复，明细保持登记内容）")
+    assert code == 201 and replay["effect"] == "idempotent"
+    assert replay["valid"] is False
+    assert [i["certificate_id"] for i in replay["items"]] == [cb, ca]
+    assert get_handover("NO-SUCH")[0] == 404
 
     print("\n全部示例执行完成 ✔")
 

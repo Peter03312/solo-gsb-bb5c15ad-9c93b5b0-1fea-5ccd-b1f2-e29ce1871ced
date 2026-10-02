@@ -317,3 +317,59 @@ VC3=$(api POST "/api/v1/windows/$VID/certificates/issue" '{"note":"v3 重新签�
 echo "$VC3" | python3 -c "import sys,json;c=json.load(sys.stdin);print('新证书',c['id'],'version',c['version'],'revoked',c['revoked'])"
 api GET "/api/v1/windows/$VID/certificates/current" \
   | python3 -c "import sys,json;c=json.load(sys.stdin);print('当前可用: 证书',c['id'],'version',c['version'])"
+
+echo "== 17. 展柜移交放行（移交单：非空单号 + 非空不重复窗口列表）=="
+echo "-- 17.1 新建两个合格窗口并各自签发合格证书 --"
+HW1=$(api POST /api/v1/windows '{"name":"移交窗口1","start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T01:00:00Z","allowed_temp_min":18,"allowed_temp_max":22,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600}')
+HW2=$(api POST /api/v1/windows '{"name":"移交窗口2","start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T01:00:00Z","allowed_temp_min":18,"allowed_temp_max":22,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600}')
+H1=$(echo "$HW1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+H2=$(echo "$HW2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for H in "$H1" "$H2"; do
+  for min in $(seq 0 10 60); do
+    if [[ "$min" -eq 60 ]]; then ts="2026-10-01T01:00:00Z"; else ts=$(printf "2026-10-01T00:%02d:00Z" "$min"); fi
+    api POST "/api/v1/windows/$H/readings" "{\"reading_id\":\"r-$min\",\"revision\":1,\"measured_at\":\"$ts\",\"temperature\":20.0}" >/dev/null
+  done
+  api POST "/api/v1/windows/$H/certificates/issue" '{"note":"移交前首签"}' >/dev/null
+done
+echo "窗口 $H1 / $H2 均已签发合格证书"
+
+echo "-- 17.2 登记移交单（顺序 H2,H1；响应明细按登记顺序，固化证书标识/版本/结论）--"
+HO=$(api POST /api/v1/handover-orders "{\"order_no\":\"HO-DEMO-001\",\"window_ids\":[$H2,$H1]}")
+echo "$HO" | python3 -m json.tool
+
+echo "-- 17.3 同单同集合重放（顺序不同也幂等）：effect=idempotent，明细顺序不变 --"
+api POST /api/v1/handover-orders "{\"order_no\":\"HO-DEMO-001\",\"window_ids\":[$H1,$H2]}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'valid:',d['valid'],'窗口顺序:',[i['window_id'] for i in d['items']])"
+
+echo "-- 17.4 拒绝路径：空/重复列表 422、空单号 422、窗口不存在 404、集合不同 409 --"
+api POST /api/v1/handover-orders '{"order_no":"HO-X","window_ids":[]}' || true
+api POST /api/v1/handover-orders "{\"order_no\":\"HO-X\",\"window_ids\":[$H1,$H1]}" || true
+api POST /api/v1/handover-orders '{"order_no":"   ","window_ids":[1]}' || true
+api POST /api/v1/handover-orders "{\"order_no\":\"HO-X\",\"window_ids\":[99999]}" || true
+api POST /api/v1/handover-orders "{\"order_no\":\"HO-DEMO-001\",\"window_ids\":[$H1]}" || true
+
+echo "-- 17.5 无当前可用证书 / 结论非合格 -> 409（整单不留记录，之后条件满足可重试）--"
+# 全新空窗口：尚无证书 -> 409（最新签发版本已撤销、结论 fail/pending 同理 409）
+HE=$(api POST /api/v1/windows '{"name":"移交窗口E","start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T01:00:00Z","allowed_temp_min":18,"allowed_temp_max":22,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600}')
+HEID=$(echo "$HE" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api POST /api/v1/handover-orders "{\"order_no\":\"HO-EMPTY\",\"window_ids\":[$HEID]}" || true
+echo "登记失败的单号查询 -> 404（整单不留记录）："
+api GET /api/v1/handover-orders/HO-EMPTY || true
+
+echo "-- 17.6 查询原单（仍有效）--"
+api GET /api/v1/handover-orders/HO-DEMO-001 \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('valid:',d['valid'],'明细:',[(i['window_id'],i['certificate_id'],i['certificate_version'],i['verdict']) for i in d['items']])"
+
+echo "-- 17.7 窗口 $H1 再签发新版本 -> 原单失效并锁存；后续再签发也不恢复 --"
+api POST "/api/v1/windows/$H1/certificates/issue" '{"note":"移交后重签 v2"}' >/dev/null
+api GET /api/v1/handover-orders/HO-DEMO-001 \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('valid:',d['valid'],'（明细仍为登记时内容）:',[(i['window_id'],i['certificate_version']) for i in d['items']])"
+
+echo "-- 17.8 撤销窗口 $H2 的引用证书同样导致失效（已失效不恢复）；重放仍返回原单 --"
+H2CID=$(echo "$HO" | python3 -c "import sys,json;print(next(i['certificate_id'] for i in json.load(sys.stdin)['items'] if i['window_id']==$H2))")
+api POST "/api/v1/certificates/$H2CID/revocation" '{"reason":"移交复核发现签发依据有误"}' >/dev/null
+api GET /api/v1/handover-orders/HO-DEMO-001 | python3 -c "import sys,json;print('valid:',json.load(sys.stdin)['valid'])"
+api POST /api/v1/handover-orders "{\"order_no\":\"HO-DEMO-001\",\"window_ids\":[$H2,$H1]}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('重放 effect:',d['effect'],'valid:',d['valid'])"
+echo "不存在单号查询 -> 404："
+api GET /api/v1/handover-orders/NO-SUCH-ORDER || true

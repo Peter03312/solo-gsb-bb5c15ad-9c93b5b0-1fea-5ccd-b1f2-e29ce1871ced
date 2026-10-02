@@ -8,10 +8,11 @@ from typing import Any, Optional
 from fastapi import HTTPException, status
 
 from .evaluation import evaluate
-from .models import READING_VOIDED, VERDICT_LABELS_ZH
+from .models import READING_VOIDED, VERDICT_LABELS_ZH, Verdict
 from .report import build_revision_report
 from .schemas import (
     CertificateRevokeSubmit,
+    HandoverOrderSubmit,
     ReadingBatchSubmit,
     ReadingSubmit,
     ReadingVoidSubmit,
@@ -1135,3 +1136,216 @@ def revision_report(conn: sqlite3.Connection,
     old_cert = certificate_to_dict(old_row)
     new_cert = certificate_to_dict(new_row)
     return build_revision_report(old_cert, new_cert)
+
+
+# ---------------------------------------------------------------- 展柜移交单（放行）
+
+def _window_set_key(window_ids: list[int]) -> str:
+    """窗口集合规范化键：排序去重后逗号拼接（重放不计顺序）。"""
+    return ",".join(str(w) for w in sorted(set(window_ids)))
+
+
+def _current_pass_certificate_row(
+    conn: sqlite3.Connection, window_id: int
+) -> Optional[sqlite3.Row]:
+    """窗口可用于移交放行的证书行：当前可用（最新签发版本未撤销）且结论合格。
+
+    最新签发版本已撤销时不自动退回旧版（即使旧版未撤销）；结论非合格的
+    当前可用证书同样不能用于放行。无可用行时返回 None。
+    """
+    row = get_current_certificate_row(conn, window_id)
+    if row is None or row["verdict"] != Verdict.PASS.value:
+        return None
+    return row
+
+
+def _evaluate_handover_validity(
+    conn: sqlite3.Connection, item_rows: list[sqlite3.Row]
+) -> bool:
+    """按当前已提交状态核对移交单引用的每张证书是否仍有效。
+
+    任一引用证书已撤销，或其所在窗口已有更新的签发版本（不论新版本是否
+    撤销、结论如何），整单失效。全部引用证书仍为各窗口最新签发版本且
+    未撤销时有效。
+    """
+    for item in item_rows:
+        cert = conn.execute(
+            "SELECT revoked_reason, window_id, version FROM certificates WHERE id=?",
+            (item["certificate_id"],),
+        ).fetchone()
+        # 证书不会被删除；缺失仅属理论防御，按失效处理。
+        if cert is None or cert["revoked_reason"] is not None:
+            return False
+        latest = conn.execute(
+            "SELECT MAX(version) AS v FROM certificates WHERE window_id=?",
+            (cert["window_id"],),
+        ).fetchone()
+        if latest["v"] is None or latest["v"] != cert["version"]:
+            return False
+    return True
+
+
+def _refresh_order_validity(
+    conn: sqlite3.Connection, order_pk: int, item_rows: list[sqlite3.Row]
+) -> int:
+    """重算并锁存移交单有效状态：只允许 有效 -> 失效，后续再签发也不恢复。
+
+    返回刷新后的 valid（1/0）。
+    """
+    order = conn.execute(
+        "SELECT valid FROM handover_orders WHERE id=?", (order_pk,)
+    ).fetchone()
+    if int(order["valid"]) == 1 and not _evaluate_handover_validity(conn, item_rows):
+        conn.execute("UPDATE handover_orders SET valid=0 WHERE id=?", (order_pk,))
+        return 0
+    return int(order["valid"])
+
+
+def _load_order(conn: sqlite3.Connection, order_no: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM handover_orders WHERE order_no=?", (order_no,)
+    ).fetchone()
+
+
+def _load_order_items(conn: sqlite3.Connection, order_pk: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM handover_order_items WHERE order_pk=? ORDER BY position ASC",
+        (order_pk,),
+    ).fetchall()
+
+
+def handover_order_to_dict(
+    conn: sqlite3.Connection, order: sqlite3.Row,
+    item_rows: list[sqlite3.Row], valid: Optional[int] = None,
+) -> dict[str, Any]:
+    """移交单行 -> API 输出（明细保持登记顺序与登记内容）。"""
+    items = [
+        {
+            "window_id": row["window_id"],
+            "certificate_id": row["certificate_id"],
+            "certificate_version": row["certificate_version"],
+            "verdict": row["verdict"],
+            "verdict_label_zh": VERDICT_LABELS_ZH.get(row["verdict"], row["verdict"]),
+        }
+        for row in item_rows
+    ]
+    return {
+        "order_no": order["order_no"],
+        "items": items,
+        "valid": bool(order["valid"] if valid is None else valid),
+        "registered_at": order["registered_at"],
+        "window_count": len(items),
+    }
+
+
+def register_handover_order(
+    conn: sqlite3.Connection, payload: HandoverOrderSubmit
+) -> tuple[str, dict[str, Any]]:
+    """登记移交放行单（调用方需已持有 BEGIN IMMEDIATE 写事务）。
+
+    校验顺序：
+    1. 空单号/空列表/重复/非正整数由请求模型拦截（422）；
+    2. 同一单号已存在：窗口集合（不计顺序）相同则重放（返回原单与当前
+       状态，即使原单已失效），集合不同 -> 409；
+    3. 任一窗口不存在 -> 404；
+    4. 任一窗口缺当前可用证书或当前证书结论非合格 -> 409，整单不留记录；
+    5. 全部通过才在一个事务内一次登记，并固化各窗口证书标识/版本/结论。
+    """
+    key = _window_set_key(payload.window_ids)
+
+    existing = _load_order(conn, payload.order_no)
+    if existing is not None:
+        if existing["window_set_key"] != key:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"移交单号 {payload.order_no} 已登记且窗口集合不同："
+                    f"已存窗口集合 [{existing['window_set_key']}]，"
+                    f"本次窗口集合 [{key}]（按集合比对，不计顺序）。"
+                    "同一移交单号只能重放同一窗口集合。"
+                ),
+            )
+        item_rows = _load_order_items(conn, existing["id"])
+        valid = _refresh_order_validity(conn, existing["id"], item_rows)
+        refreshed = _load_order(conn, payload.order_no)
+        return "idempotent", handover_order_to_dict(conn, refreshed, item_rows, valid)
+
+    # 新单：先确认每个窗口都存在（任一不存在 -> 404）
+    missing = [
+        wid for wid in payload.window_ids
+        if conn.execute("SELECT 1 FROM windows WHERE id=?", (wid,)).fetchone() is None
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"窗口不存在：{missing}（移交放行要求每个窗口都存在）",
+        )
+
+    # 每个窗口必须有当前可用证书（最新签发版本未撤销）且结论为合格
+    blocked: list[str] = []
+    cert_rows: list[sqlite3.Row] = []
+    for wid in payload.window_ids:
+        cert = _current_pass_certificate_row(conn, wid)
+        if cert is None:
+            current = get_current_certificate_row(conn, wid)
+            if current is None:
+                blocked.append(
+                    f"窗口 {wid} 缺少当前可用证书（尚无证书，或最新签发版本已撤销"
+                    "且不自动退回旧版）"
+                )
+            else:
+                blocked.append(
+                    f"窗口 {wid} 当前可用证书（证书 {current['id']}，版本 "
+                    f"{current['version']}）结论为 "
+                    f"{VERDICT_LABELS_ZH.get(current['verdict'], current['verdict'])}"
+                    f"（{current['verdict']}），非合格"
+                )
+        else:
+            cert_rows.append(cert)
+    if blocked:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="移交放行拒绝：" + "；".join(blocked)
+                   + "（整单不留记录；证书合格且未撤销后可用同一单号重新申请）",
+        )
+
+    # 一次登记移交单 + 固化明细（顺序与请求一致）
+    cur = conn.execute(
+        "INSERT INTO handover_orders (order_no, window_set_key, valid) VALUES (?, ?, 1)",
+        (payload.order_no, key),
+    )
+    order_pk = int(cur.lastrowid)
+    conn.executemany(
+        """
+        INSERT INTO handover_order_items
+            (order_pk, window_id, position, certificate_id,
+             certificate_version, verdict)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (order_pk, wid, pos, cert["id"], cert["version"], cert["verdict"])
+            for pos, (wid, cert) in enumerate(zip(payload.window_ids, cert_rows))
+        ],
+    )
+    order = _load_order(conn, payload.order_no)
+    item_rows = _load_order_items(conn, order_pk)
+    return "created", handover_order_to_dict(conn, order, item_rows, 1)
+
+
+def get_handover_order(conn: sqlite3.Connection, order_no: str) -> dict[str, Any]:
+    """按单号查询移交单（调用方需已持有 BEGIN IMMEDIATE 写事务）。
+
+    保留登记时明细不变，并按同一已提交状态核对每张引用证书：只要有撤销
+    或已有更新签发版本，整单标为失效并锁存（后续再签发也不恢复）。
+    单号不存在 -> 404。
+    """
+    order = _load_order(conn, order_no)
+    if order is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"移交单 {order_no} 不存在",
+        )
+    item_rows = _load_order_items(conn, order["id"])
+    valid = _refresh_order_validity(conn, order["id"], item_rows)
+    refreshed = _load_order(conn, order_no)
+    return handover_order_to_dict(conn, refreshed, item_rows, valid)

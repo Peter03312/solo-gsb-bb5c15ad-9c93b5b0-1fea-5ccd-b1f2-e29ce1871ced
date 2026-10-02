@@ -471,6 +471,74 @@ class ErrorBody(BaseModel):
     detail: str
 
 
+# ------------------------------------------------------------ 展柜移交单（放行）
+
+class HandoverOrderSubmit(BaseModel):
+    """馆员申请展柜移交放行：非空移交单号 + 非空、不重复的窗口标识列表。
+
+    - 只有每个窗口都存在、且其当前可用证书（最新签发版本未撤销）结论为
+      合格，才在单个写事务内一次登记移交单，固化各窗口对应的证书标识、
+      版本与结论；任一窗口不存在 -> 404；
+    - 窗口缺当前可用证书（无证书或最新版已撤销）或结论非合格 -> 409，
+      整单不留记录；
+    - 窗口列表为空、含重复标识、窗口标识非正整数，或移交单号为空/只含
+      空白 -> 422；
+    - 同一单号按窗口集合（不计顺序）重放 -> 返回原单及当前状态；
+      集合不同 -> 409。
+    """
+
+    order_no: str = Field(..., min_length=1, max_length=100,
+                          description="移交单号（非空，不能只含空白字符）")
+    window_ids: list[int] = Field(
+        ..., min_length=1, description="非空窗口标识列表（至少 1 个；不得重复；正整数）")
+
+    @field_validator("order_no")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("移交单号不能为空（不能只含空白字符）")
+        return v
+
+    @field_validator("window_ids")
+    @classmethod
+    def _positive_unique(cls, v: list[int]) -> list[int]:
+        for wid in v:
+            if wid <= 0:
+                raise ValueError("窗口标识必须为正整数")
+        if len(v) != len(set(v)):
+            dup = sorted({x for x in v if v.count(x) > 1})
+            raise ValueError(f"窗口标识列表不得重复，重复项：{dup}")
+        return v
+
+
+class HandoverOrderItemOut(BaseModel):
+    """移交单明细：登记时固化的窗口—证书对应关系（永不修改）。"""
+
+    window_id: int
+    certificate_id: int = Field(..., description="登记时该窗口当前可用证书标识")
+    certificate_version: int = Field(..., description="登记时该证书版本号")
+    verdict: str = Field(..., description="登记时该证书结论（合格 pass）")
+    verdict_label_zh: str
+
+
+class HandoverOrderOut(BaseModel):
+    """移交单：单号 + 登记时明细 + 当前有效状态（查询时按同一已提交状态核对）。"""
+
+    order_no: str
+    items: list[HandoverOrderItemOut] = Field(
+        ..., description="登记时固化的各窗口证书标识/版本/结论（顺序与登记请求一致）")
+    valid: bool = Field(
+        ..., description="当前是否有效：任一引用证书被撤销或已存在更新签发版本则为 false；一旦失效不恢复")
+    registered_at: str = Field(..., description="登记时间（UTC）")
+    window_count: int = Field(..., description="窗口数量")
+
+
+class HandoverOrderResponse(HandoverOrderOut):
+    """登记/重放响应：created 首次登记；idempotent 同单同窗口集合重放。"""
+
+    effect: str = Field(..., description="created | idempotent")
+
+
 # WindowOut.current_certificate 前向引用了后文定义的 CertificateOut，
 # 全部模型定义完成后重建一次以解析该引用。
 WindowOut.model_rebuild()

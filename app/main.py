@@ -15,6 +15,9 @@ from .schemas import (
     CertificateRevokeResponse,
     CertificateRevokeSubmit,
     EvaluationOut,
+    HandoverOrderOut,
+    HandoverOrderResponse,
+    HandoverOrderSubmit,
     IssueRequest,
     ReadingBatchSubmit,
     ReadingBatchSubmitResponse,
@@ -46,7 +49,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -54,8 +57,11 @@ app = FastAPI(
         "窗口规则版本化修订（初始规则为第 1 版，连续修订号 + 非空原因）、"
         "证书版本化签发与已签发证书撤销（凭非空原因，只改有效性、快照不变；"
         "仅最新签发版本未撤销时窗口有当前可用证书），"
-        "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
-        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值）。"
+        "可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
+        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值），"
+        "并支持馆员办理展柜移交放行（非空移交单号 + 非空不重复窗口列表；"
+        "逐窗口固化当前合格且未撤销的最新签发证书；引用证书被撤销或出现"
+        "更新签发版本即整单失效且不恢复；同单按窗口集合重放）。"
     ),
     lifespan=lifespan,
 )
@@ -378,3 +384,42 @@ def get_certificate(
     certificate_id: int, conn: sqlite3.Connection = Depends(get_conn)
 ) -> dict[str, Any]:
     return services.get_certificate(conn, certificate_id)
+
+
+# ---------------------------------------------------------------- 展柜移交放行
+
+@app.post("/api/v1/handover-orders", response_model=HandoverOrderResponse,
+          status_code=status.HTTP_201_CREATED, tags=["handovers"])
+def register_handover_order(
+    payload: HandoverOrderSubmit, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """馆员办理展柜移交放行：非空移交单号 + 非空、不重复的窗口标识列表。
+
+    - 只有每个窗口都存在，且其当前可用证书（最新签发版本未撤销）结论为
+      合格，才在一个写事务内一次登记移交单，固化各窗口对应的证书标识、
+      版本与结论，返回单号、明细及当前有效状态；
+    - 任一窗口不存在 -> 404；窗口缺当前可用证书或结论非合格 -> 409，
+      整单不留记录；窗口列表为空/重复标识、单号为空 -> 422；
+    - 同一单号按窗口集合（不计顺序）重放 -> effect=idempotent，返回原单
+      及当前状态（即使原单已失效）；窗口集合不同 -> 409；
+    - 与证书签发/撤销同在 BEGIN IMMEDIATE 事务中串行，结果对应实际提交
+      的同一已提交状态。
+    """
+    with write_transaction(conn):
+        effect, order = services.register_handover_order(conn, payload)
+        return {"effect": effect, **order}
+
+
+@app.get("/api/v1/handover-orders/{order_no}", response_model=HandoverOrderOut,
+         tags=["handovers"])
+def get_handover_order(
+    order_no: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """按移交单号查询原单及当前有效状态。
+
+    保留登记时明细（证书标识/版本/结论）不变，并在一个写事务内按同一
+    已提交状态核对每张引用证书：只要有撤销或已有更新签发版本，整单标为
+    失效并锁存（后续再签发也不恢复原单）。单号不存在 -> 404。
+    """
+    with write_transaction(conn):
+        return services.get_handover_order(conn, order_no)

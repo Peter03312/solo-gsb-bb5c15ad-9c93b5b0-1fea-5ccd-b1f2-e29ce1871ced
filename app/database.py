@@ -7,6 +7,9 @@
 - 签发在一个事务内读取“同一已提交状态”的全部活动读数并生成快照，
   事务期间写入方要么在签发前提交（修订可见，签发与修订并发时以
   同一已提交状态计算），要么在签发提交后才生效（快照不受影响）。
+- 移交放行（登记/查询）同样在 BEGIN IMMEDIATE 事务内核对各窗口最新
+  签发版本与其撤销状态，与签发/撤销并发时结果以实际提交顺序为准；
+  失效状态一旦置位不随后续签发恢复。
 """
 from __future__ import annotations
 
@@ -108,6 +111,33 @@ CREATE TABLE IF NOT EXISTS certificates (
 
 CREATE INDEX IF NOT EXISTS idx_certificates_window
     ON certificates(window_id, version);
+
+-- 展柜移交单（放行登记）：馆员以非空移交单号 + 非空且不重复的窗口标识列表
+-- 申请放行。登记时逐窗口固化其当时“当前可用证书”（最新签发且未撤销、结论
+-- 合格）的证书标识、版本与结论；明细一旦登记不可变。窗口集合的规范化键
+-- （排序后逗号拼接）用于同单重放（不计顺序）。
+CREATE TABLE IF NOT EXISTS handover_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no TEXT NOT NULL UNIQUE,             -- 非空移交单号（业务幂等键）
+    window_set_key TEXT NOT NULL,             -- 窗口标识排序去重后逗号拼接（重放比对用）
+    valid INTEGER NOT NULL,                   -- 有效状态：1 有效 / 0 失效（一旦失效不恢复）
+    registered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 移交单明细：登记时固化各窗口引用的证书标识/版本/结论，永不修改
+CREATE TABLE IF NOT EXISTS handover_order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_pk INTEGER NOT NULL REFERENCES handover_orders(id),
+    window_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,                -- 登记请求中的原始顺序（响应按此返回）
+    certificate_id INTEGER NOT NULL,
+    certificate_version INTEGER NOT NULL,
+    verdict TEXT NOT NULL,                     -- 登记时结论（恒为 pass 合格）
+    UNIQUE(order_pk, window_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_handover_items_order
+    ON handover_order_items(order_pk, position);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，

@@ -467,6 +467,58 @@ class RevisionReportOut(BaseModel):
     summary: ReportSummary
 
 
+# ------------------------------------------------------------ 移交放行单
+
+class HandoverOrderSubmit(BaseModel):
+    """馆员办理展柜移交：凭非空移交单号 + 非空窗口标识列表申请放行。
+
+    - 窗口标识列表非空且不得重复（422）；任一窗口不存在（404）；
+    - 每个窗口都必须有当前可用证书（最新签发版本未撤销）且结论合格，
+      否则整单不予登记（409，不留记录）；
+    - 同一单号按窗口集合（不计顺序）重放 -> 返回原单及当前有效状态
+      （即使原单已失效）；窗口集合不同 -> 409。
+    """
+
+    handover_no: str = Field(..., min_length=1, max_length=100,
+                             description="移交单号（非空，不能只含空白字符；全局唯一）")
+    window_ids: list[int] = Field(..., min_length=1,
+                                  description="非空窗口标识列表（不得重复）")
+
+    @field_validator("handover_no")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("移交单号不能为空（不能只含空白字符）")
+        return v
+
+
+class HandoverOrderItemOut(BaseModel):
+    """移交单明细：登记时固化的窗口-证书对应，及查询时的核对结果。"""
+
+    window_id: int
+    certificate_id: int = Field(..., description="登记时固化的证书标识")
+    certificate_version: int = Field(..., description="登记时固化的证书版本")
+    verdict: str = Field(..., description="登记时固化的证书结论")
+    verdict_label_zh: str
+    certificate_revoked: bool = Field(..., description="查询时该引用证书是否已撤销")
+    has_newer_version: bool = Field(..., description="查询时该窗口是否已有更新版本证书")
+    item_valid: bool = Field(..., description="该明细当前是否有效（未撤销且无更新版本）")
+
+
+class HandoverOrderOut(BaseModel):
+    handover_no: str
+    status: str = Field(..., description="valid | invalid")
+    status_label_zh: str = Field(..., description="有效 | 失效")
+    created_at: str = Field(..., description="登记时间（UTC）")
+    items: list[HandoverOrderItemOut] = Field(
+        ..., description="登记时明细（固化，顺序与申请列表一致）+ 查询时逐证核对结果")
+
+
+class HandoverOrderSubmitResponse(BaseModel):
+    effect: str = Field(..., description="created | idempotent")
+    order: HandoverOrderOut
+
+
 class ErrorBody(BaseModel):
     detail: str
 

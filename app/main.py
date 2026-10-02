@@ -8,13 +8,16 @@ from typing import Any, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from . import services
-from .database import connect, get_conn, init_db, write_transaction
+from .database import connect, get_conn, init_db, read_transaction, write_transaction
 from .models import VERDICT_LABELS_ZH, Verdict
 from .schemas import (
     CertificateOut,
     CertificateRevokeResponse,
     CertificateRevokeSubmit,
     EvaluationOut,
+    HandoverOrderOut,
+    HandoverOrderSubmit,
+    HandoverOrderSubmitResponse,
     IssueRequest,
     ReadingBatchSubmit,
     ReadingBatchSubmitResponse,
@@ -46,7 +49,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -55,7 +58,11 @@ app = FastAPI(
         "证书版本化签发与已签发证书撤销（凭非空原因，只改有效性、快照不变；"
         "仅最新签发版本未撤销时窗口有当前可用证书），"
         "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
-        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值）。"
+        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值）；"
+        "馆员办理展柜移交时凭非空移交单号与非空窗口标识列表申请放行："
+        "逐窗口核对当前可用证书且结论合格才一次登记（固化证书标识/版本/结论），"
+        "查询时按同一已提交状态核对引用证书，任一撤销或已有更新版本即整单失效"
+        "（失效不可逆，后续再签发不恢复）。"
     ),
     lifespan=lifespan,
 )
@@ -378,3 +385,51 @@ def get_certificate(
     certificate_id: int, conn: sqlite3.Connection = Depends(get_conn)
 ) -> dict[str, Any]:
     return services.get_certificate(conn, certificate_id)
+
+
+# ---------------------------------------------------------------- 移交放行单
+
+@app.post(
+    "/api/v1/handover-orders",
+    response_model=HandoverOrderSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["handovers"],
+)
+def submit_handover_order(
+    payload: HandoverOrderSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员办理展柜移交：凭非空移交单号 + 非空窗口标识列表申请放行。
+
+    - 只有每个窗口都存在、最新签发证书未撤销（即有当前可用证书）且结论
+      为合格，才一次登记移交单：固化各窗口对应的证书标识、版本、结论，
+      返回单号、明细及有效状态（登记成功时必为 valid/有效）；
+    - 任一窗口不存在 -> 404；缺当前可用证书或结论非合格 -> 409，
+      整单不留记录；空列表或重复窗口标识 -> 422；
+    - 同一单号按窗口集合（不计顺序）重放 -> effect=idempotent，返回原单
+      及当前有效状态（即使原单已失效）；窗口集合不同 -> 409；
+    - 登记与证书签发/撤销同在 BEGIN IMMEDIATE 写事务内串行，核对到的
+      证书状态与登记结果对应同一已提交状态。
+    """
+    with write_transaction(conn):
+        effect, order = services.submit_handover_order(conn, payload)
+        return {"effect": effect, "order": order}
+
+
+@app.get(
+    "/api/v1/handover-orders/{handover_no}",
+    response_model=HandoverOrderOut,
+    tags=["handovers"],
+)
+def get_handover_order(
+    handover_no: str, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """按单号查询移交单：保留登记时明细，按同一已提交状态核对有效状态。
+
+    逐张核对引用证书：只要有撤销、或其窗口已有更新版本证书，整单标为
+    失效（invalid）；失效不可逆——后续再签发也不恢复原单。
+    单号不存在 -> 404。
+    """
+    # 读事务：多条核对读取看到同一已提交快照，不与并发签发/撤销撕裂
+    with read_transaction(conn):
+        return services.get_handover_order(conn, handover_no)

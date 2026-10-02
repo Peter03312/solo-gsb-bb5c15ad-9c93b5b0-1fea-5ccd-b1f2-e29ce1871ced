@@ -108,6 +108,33 @@ CREATE TABLE IF NOT EXISTS certificates (
 
 CREATE INDEX IF NOT EXISTS idx_certificates_window
     ON certificates(window_id, version);
+
+-- 展柜移交放行单：馆员凭非空移交单号 + 非空窗口标识列表申请放行。
+-- 只有每个窗口都存在、最新签发证书未撤销且结论合格才一次登记；
+-- 登记时固化各窗口对应的证书标识/版本/结论（明细此后不可变），
+-- 有效状态在查询时按同一已提交状态核对（见 handover_order_items 备注）。
+CREATE TABLE IF NOT EXISTS handover_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    handover_no TEXT NOT NULL UNIQUE,        -- 移交单号（非空，全局唯一）
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+-- 移交单明细：登记时固化的窗口-证书对应（证书标识/版本/结论），此后不修改。
+-- 查询时核对：引用证书被撤销、或该窗口已有更新版本证书 -> 该明细失效，
+-- 任一明细失效则整单失效；失效不可逆（后续再签发不恢复原单）。
+CREATE TABLE IF NOT EXISTS handover_order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES handover_orders(id),
+    seq INTEGER NOT NULL,                    -- 申请时窗口列表顺序（从 0 起）
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    certificate_id INTEGER NOT NULL REFERENCES certificates(id),
+    certificate_version INTEGER NOT NULL,    -- 登记时固化的证书版本
+    verdict TEXT NOT NULL,                   -- 登记时固化的证书结论
+    UNIQUE(order_id, window_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_handover_order_items_order
+    ON handover_order_items(order_id, seq);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
@@ -202,6 +229,21 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
     else:
         conn.commit()
+
+
+@contextmanager
+def read_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """读事务：WAL 下同一事务内的多次读取看到同一已提交快照。
+
+    移交单查询需按“同一已提交状态”核对多张引用证书（是否撤销/已有更新
+    版本）：用显式读事务包住多条 SELECT，避免并发签发/撤销在两次读取
+    之间提交造成快照撕裂。只读，结束时回滚即可（不落任何写）。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()
 
 
 def get_conn(request: Request) -> Iterator[sqlite3.Connection]:

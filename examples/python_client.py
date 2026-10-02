@@ -23,6 +23,12 @@
      历史证书（查询/列表/修订影响报告）仍可读并标示撤销状态；
      仅最新签发版本未撤销时窗口有当前可用证书，撤销最新版不退回旧版，
      再次签发沿用递增版本并成为当前可用证书。
+  9) 展柜移交放行单：非空移交单号 + 非空窗口标识列表申请放行；每窗口
+     最新签发证书未撤销且结论合格才一次登记（固化证书标识/版本/结论）；
+     空列表/重复标识 422、窗口不存在 404、缺当前可用证书或结论非合格
+     409（整单不留记录）；同单号同窗口集合（不计顺序）重放幂等返回原单
+     及当前状态，集合不同 409；查询时保留登记明细，任一引用证书撤销或
+     已有更新版本即整单失效，失效不可逆（后续再签发不恢复）。
 """
 from __future__ import annotations
 
@@ -111,6 +117,15 @@ def revoke_cert(cid, reason):
 
 def current_certificate(wid):
     return call("GET", f"/api/v1/windows/{wid}/certificates/current")
+
+
+def handover(no, wids):
+    return call("POST", "/api/v1/handover-orders",
+                {"handover_no": no, "window_ids": wids})
+
+
+def get_handover(no):
+    return call("GET", f"/api/v1/handover-orders/{no}")
 
 
 def item(rid, rev, minute, temp):
@@ -495,5 +510,86 @@ def main() -> None:
     print("\n全部示例执行完成 ✔")
 
 
+def handover_demo() -> None:
+    """展柜移交放行单：申请放行、幂等重放、拒绝路径、查询失效。"""
+    show("移交放行单：申请放行（非空单号 + 非空窗口标识列表）")
+    # 两个满覆盖合格窗口并各自签发
+    h1 = create_window("展柜H1-移交", 5, max_exceed=300, max_gap=120)
+    h2 = create_window("展柜H2-移交", 5, max_exceed=300, max_gap=120)
+    for w in (h1, h2):
+        for m in range(6):
+            assert submit(w, f"r{m}", 1, m, 20.0)[0] == 201
+    hc1 = call("POST", f"/api/v1/windows/{h1}/certificates/issue", {"note": "移交前签发"})[1]
+    hc2 = call("POST", f"/api/v1/windows/{h2}/certificates/issue", {"note": "移交前签发"})[1]
+
+    # 申请放行：每个窗口都有当前可用证书且结论合格 -> 一次登记，固化证书标识/版本/结论
+    code, r = handover("HJ-2026-0001", [h1, h2])
+    print("申请放行:", code, r["effect"], "->", r["order"]["status"], r["order"]["status_label_zh"])
+    assert code == 201 and r["effect"] == "created"
+    order = r["order"]
+    assert order["status"] == "valid"
+    for it in order["items"]:
+        print(f"  窗口 {it['window_id']}: 证书 {it['certificate_id']} "
+              f"v{it['certificate_version']} {it['verdict_label_zh']} "
+              f"(有效 item_valid={it['item_valid']})")
+    assert [it["certificate_id"] for it in order["items"]] == [hc1["id"], hc2["id"]]
+
+    # 同一单号 + 同一窗口集合（不计顺序）重放 -> 幂等返回原单，不产生新记录
+    code, r = handover("HJ-2026-0001", [h2, h1])
+    print("同集合重放:", code, r["effect"], "（登记时间不变:",
+          r["order"]["created_at"] == order["created_at"], ")")
+    assert code == 201 and r["effect"] == "idempotent" and r["order"] == order
+
+    # 拒绝路径：空列表 / 重复标识 / 空白单号 -> 422；窗口不存在 -> 404；集合不同 -> 409
+    assert handover("HJ-X1", [])[0] == 422
+    assert handover("HJ-X2", [h1, h1])[0] == 422
+    assert handover("   ", [h1])[0] == 422
+    assert handover("HJ-X3", [99999])[0] == 404
+    assert handover("HJ-2026-0001", [h1])[0] == 409
+    print("拒绝路径：空列表/重复标识/空白单号 422，窗口不存在 404，同号不同集合 409")
+
+    # 缺当前可用证书（无证书 / 最新版已撤销）或结论非合格 -> 409，整单不留记录
+    h3 = create_window("展柜H3-无证书", 5, max_exceed=300, max_gap=120)
+    code, r = handover("HJ-X4", [h3])
+    print("无证书窗口:", code, "-", r["detail"][:40], "...")
+    assert code == 409 and get_handover("HJ-X4")[0] == 404
+    h4 = create_window("展柜H4-不合格", 10, max_exceed=300, max_gap=600)
+    for rid, m, t in [("a", 0, 20.0), ("b", 1, 24.0), ("c", 10, 20.0)]:
+        assert submit(h4, rid, 1, m, t)[0] == 201
+    call("POST", f"/api/v1/windows/{h4}/certificates/issue", {"note": "fail"})
+    assert handover("HJ-X5", [h4])[0] == 409
+    print("结论非合格窗口: 409；两单均未留记录（单号可再用）")
+
+    # 查询：登记明细保留；撤销任一引用证书 -> 整单失效
+    code, r = revoke_cert(hc1["id"], "签发依据有误：r2 为误采")
+    assert code == 201
+    code, o = get_handover("HJ-2026-0001")
+    print("撤销引用证书后查询:", o["status"], o["status_label_zh"],
+          "（固化明细不变:", [(i["certificate_id"], i["certificate_version"]) for i in o["items"]], ")")
+    assert o["status"] == "invalid"
+    assert o["items"][0]["certificate_revoked"] is True
+    assert o["items"][1]["item_valid"] is True
+
+    # 失效后同集合重放仍返回原单（当前状态=失效）；后续再签发不恢复
+    code, r = handover("HJ-2026-0001", [h1, h2])
+    assert code == 201 and r["effect"] == "idempotent" and r["order"]["status"] == "invalid"
+    call("POST", f"/api/v1/windows/{h1}/certificates/issue", {"note": "撤销后重签"})
+    code, o = get_handover("HJ-2026-0001")
+    print("重放仍返回原单（失效）；窗口再签发后查询:", o["status"], "（失效不可逆）")
+    assert o["status"] == "invalid"
+    assert o["items"][0]["has_newer_version"] is True
+
+    # 窗口已有更新版本证书同样使整单失效
+    call("POST", f"/api/v1/windows/{h2}/certificates/issue", {"note": "v2"})
+    code, o = get_handover("HJ-2026-0001")
+    assert o["items"][1]["has_newer_version"] is True
+    print("引用证书已有更新版本 -> 明细 item_valid=False，整单失效")
+
+    # 单号不存在 -> 404
+    assert get_handover("HJ-GHOST")[0] == 404
+    print("单号不存在查询: 404")
+
+
 if __name__ == "__main__":
     main()
+    handover_demo()

@@ -8,10 +8,18 @@ from typing import Any, Optional
 from fastapi import HTTPException, status
 
 from .evaluation import evaluate
-from .models import READING_VOIDED, VERDICT_LABELS_ZH
+from .models import (
+    HANDOVER_INVALID,
+    HANDOVER_STATUS_LABELS_ZH,
+    HANDOVER_VALID,
+    READING_VOIDED,
+    VERDICT_LABELS_ZH,
+    Verdict,
+)
 from .report import build_revision_report
 from .schemas import (
     CertificateRevokeSubmit,
+    HandoverOrderSubmit,
     ReadingBatchSubmit,
     ReadingSubmit,
     ReadingVoidSubmit,
@@ -1135,3 +1143,161 @@ def revision_report(conn: sqlite3.Connection,
     old_cert = certificate_to_dict(old_row)
     new_cert = certificate_to_dict(new_row)
     return build_revision_report(old_cert, new_cert)
+
+
+# ---------------------------------------------------------------- 移交放行单
+
+def submit_handover_order(
+    conn: sqlite3.Connection, payload: HandoverOrderSubmit
+) -> tuple[str, dict[str, Any]]:
+    """登记展柜移交放行单，返回 (effect, order_dict)。调用方需已持有写事务。
+
+    - 窗口标识列表重复 -> 422（空列表、空单号由请求模型先拦截）；
+    - 同一单号重放：窗口集合（不计顺序）一致 -> ("idempotent", 原单及当前
+      有效状态)，即使原单已失效也照返，不产生新记录；集合不同 -> 409；
+    - 任一窗口不存在 -> 404；
+    - 任一窗口缺当前可用证书（尚无证书，或最新签发版本已撤销）或结论非合格
+      -> 409，整单不留记录（写事务回滚）；
+    - 全部满足才一次登记：整单 + 明细，固化各窗口对应证书标识/版本/结论。
+    """
+    seen: set[int] = set()
+    for wid in payload.window_ids:
+        if wid in seen:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"移交单拒收：窗口标识 {wid} 在列表中重复，窗口标识列表不得重复。",
+            )
+        seen.add(wid)
+
+    existing = conn.execute(
+        "SELECT * FROM handover_orders WHERE handover_no=?", (payload.handover_no,)
+    ).fetchone()
+    if existing is not None:
+        stored = {
+            r["window_id"]
+            for r in conn.execute(
+                "SELECT window_id FROM handover_order_items WHERE order_id=?",
+                (existing["id"],),
+            ).fetchall()
+        }
+        if stored == set(payload.window_ids):
+            # 重放：返回原单及当前有效状态（即使已失效），不产生新记录
+            return "idempotent", handover_order_to_dict(conn, existing)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"移交单号「{payload.handover_no}」已登记，窗口集合不一致："
+                f"已登记 {sorted(stored)}，本次 {sorted(set(payload.window_ids))}。"
+                "同一单号重放必须使用相同窗口集合（不计顺序）。"
+            ),
+        )
+
+    # 任一窗口不存在 -> 404（先于证书校验，按申请顺序逐个确认）
+    for wid in payload.window_ids:
+        get_window_row(conn, wid)
+
+    # 逐窗口核对：最新签发证书未撤销（即当前可用证书）且结论合格；
+    # 任一不满足 -> 409，整单不留记录
+    certs: list[sqlite3.Row] = []
+    for wid in payload.window_ids:
+        cert = get_current_certificate_row(conn, wid)
+        if cert is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"窗口 {wid} 缺当前可用证书（尚无证书，或最新签发版本已撤销"
+                    "且不自动退回旧版），整单不予登记。"
+                ),
+            )
+        if cert["verdict"] != Verdict.PASS.value:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"窗口 {wid} 当前可用证书（版本 {cert['version']}）结论为"
+                    f"「{VERDICT_LABELS_ZH.get(cert['verdict'], cert['verdict'])}」"
+                    f"（{cert['verdict']}），非合格，整单不予登记。"
+                ),
+            )
+        certs.append(cert)
+
+    # 一次登记：整单 + 明细（固化证书标识/版本/结论，此后不可变）
+    cur = conn.execute(
+        "INSERT INTO handover_orders (handover_no) VALUES (?)",
+        (payload.handover_no,),
+    )
+    order_id = int(cur.lastrowid)
+    conn.executemany(
+        """
+        INSERT INTO handover_order_items
+            (order_id, seq, window_id, certificate_id, certificate_version, verdict)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (order_id, seq, wid, cert["id"], cert["version"], cert["verdict"])
+            for seq, (wid, cert) in enumerate(zip(payload.window_ids, certs))
+        ],
+    )
+    order = conn.execute(
+        "SELECT * FROM handover_orders WHERE id=?", (order_id,)
+    ).fetchone()
+    return "created", handover_order_to_dict(conn, order)
+
+
+def get_handover_order(conn: sqlite3.Connection, handover_no: str) -> dict[str, Any]:
+    """按单号查询移交单：保留登记时明细，并按同一已提交状态核对有效状态。"""
+    row = conn.execute(
+        "SELECT * FROM handover_orders WHERE handover_no=?", (handover_no,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"移交单「{handover_no}」不存在",
+        )
+    return handover_order_to_dict(conn, row)
+
+
+def handover_order_to_dict(
+    conn: sqlite3.Connection, order_row: sqlite3.Row
+) -> dict[str, Any]:
+    """移交单 -> API 输出：登记时明细原样保留，有效状态按当前已提交状态核对。
+
+    任一引用证书被撤销、或其窗口已有更新版本证书 -> 该明细失效，整单失效；
+    撤销不可回退、证书版本只增不减，失效一旦成立后续再签发也不恢复原单。
+    """
+    items = conn.execute(
+        "SELECT * FROM handover_order_items WHERE order_id=? ORDER BY seq ASC",
+        (order_row["id"],),
+    ).fetchall()
+    item_dicts: list[dict[str, Any]] = []
+    all_valid = True
+    for it in items:
+        cert = conn.execute(
+            "SELECT revoked_reason FROM certificates WHERE id=?",
+            (it["certificate_id"],),
+        ).fetchone()
+        revoked = cert is not None and cert["revoked_reason"] is not None
+        latest = conn.execute(
+            "SELECT MAX(version) AS v FROM certificates WHERE window_id=?",
+            (it["window_id"],),
+        ).fetchone()
+        has_newer = int(latest["v"] or 0) > it["certificate_version"]
+        item_valid = not revoked and not has_newer
+        all_valid = all_valid and item_valid
+        item_dicts.append({
+            "window_id": it["window_id"],
+            "certificate_id": it["certificate_id"],
+            "certificate_version": it["certificate_version"],
+            "verdict": it["verdict"],
+            "verdict_label_zh": VERDICT_LABELS_ZH.get(it["verdict"], it["verdict"]),
+            "certificate_revoked": revoked,
+            "has_newer_version": has_newer,
+            "item_valid": item_valid,
+        })
+    status_value = HANDOVER_VALID if all_valid else HANDOVER_INVALID
+    return {
+        "handover_no": order_row["handover_no"],
+        "status": status_value,
+        "status_label_zh": HANDOVER_STATUS_LABELS_ZH[status_value],
+        "created_at": order_row["created_at"],
+        "items": item_dicts,
+    }

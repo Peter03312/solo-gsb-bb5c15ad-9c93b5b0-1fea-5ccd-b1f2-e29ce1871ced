@@ -31,3 +31,13 @@ READING_SUPERSEDED = "superseded"
 # 误采作废：作废本身作为该 ID 的一条修订留存（原因/操作时间/前一版本），
 # 留存期间该 ID 没有活动读数；更高修订号提交可恢复
 READING_VOIDED = "voided"
+
+# 移交单有效状态：登记成功时必为有效；查询时按同一已提交状态核对引用证书，
+# 任一被撤销或其窗口已有更新版本 -> 整单失效。撤销不可回退、版本只增不减，
+# 失效一旦成立即不可逆（后续再签发也不恢复原单）。
+HANDOVER_VALID = "valid"
+HANDOVER_INVALID = "invalid"
+HANDOVER_STATUS_LABELS_ZH = {
+    HANDOVER_VALID: "有效",
+    HANDOVER_INVALID: "失效",
+}

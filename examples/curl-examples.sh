@@ -317,3 +317,65 @@ VC3=$(api POST "/api/v1/windows/$VID/certificates/issue" '{"note":"v3 重新签�
 echo "$VC3" | python3 -c "import sys,json;c=json.load(sys.stdin);print('新证书',c['id'],'version',c['version'],'revoked',c['revoked'])"
 api GET "/api/v1/windows/$VID/certificates/current" \
   | python3 -c "import sys,json;c=json.load(sys.stdin);print('当前可用: 证书',c['id'],'version',c['version'])"
+
+echo "== 17. 展柜移交放行单（非空单号 + 非空窗口标识列表申请放行）=="
+# 两个满覆盖合格窗口（5 分钟、间隔 60s、温度 20.0）
+H1=$(api POST /api/v1/windows '{
+  "name": "展柜H1-移交", "start_at": "2026-10-01T00:00:00Z", "end_at": "2026-10-01T00:05:00Z",
+  "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 120
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+H2=$(api POST /api/v1/windows '{
+  "name": "展柜H2-移交", "start_at": "2026-10-01T00:00:00Z", "end_at": "2026-10-01T00:05:00Z",
+  "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 120
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for W in $H1 $H2; do
+  for m in 0 1 2 3 4 5; do
+    api POST "/api/v1/windows/$W/readings" \
+      "{\"reading_id\":\"r-$m\",\"revision\":1,\"measured_at\":\"2026-10-01T00:0$m:00Z\",\"temperature\":20.0}" >/dev/null
+  done
+done
+HC1=$(api POST "/api/v1/windows/$H1/certificates/issue" '{"note":"移交前签发"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+HC2=$(api POST "/api/v1/windows/$H2/certificates/issue" '{"note":"移交前签发"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+# 移交单号全局唯一：用本 run 的窗口号构造，保证脚本可重复运行
+HNO="HJ-2026-$H1$H2"
+
+echo "-- 17.1 申请放行：每个窗口都有当前可用证书且结论合格 -> 一次登记，固化证书标识/版本/结论 --"
+api POST /api/v1/handover-orders "{\"handover_no\":\"$HNO\",\"window_ids\":[$H1,$H2]}" \
+  | python3 -m json.tool
+
+echo "-- 17.2 同一单号按窗口集合（不计顺序）重放 -> 幂等返回原单及当前状态 --"
+api POST /api/v1/handover-orders "{\"handover_no\":\"$HNO\",\"window_ids\":[$H2,$H1]}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'status:',d['order']['status'],'created_at 不变:',d['order']['created_at'])"
+
+echo "-- 17.3 拒绝路径：空列表 422 / 重复标识 422 / 空白单号 422 / 窗口不存在 404 / 同号不同集合 409 --"
+api POST /api/v1/handover-orders '{"handover_no":"HJ-X1","window_ids":[]}' || true
+api POST /api/v1/handover-orders "{\"handover_no\":\"HJ-X2\",\"window_ids\":[$H1,$H1]}" || true
+api POST /api/v1/handover-orders "{\"handover_no\":\"   \",\"window_ids\":[$H1]}" || true
+api POST /api/v1/handover-orders '{"handover_no":"HJ-X3","window_ids":[99999]}' || true
+api POST /api/v1/handover-orders "{\"handover_no\":\"$HNO\",\"window_ids\":[$H1]}" || true
+
+echo "-- 17.4 缺当前可用证书或结论非合格 -> 409，整单不留记录（单号可再用）--"
+# 无证书窗口
+H3=$(api POST /api/v1/windows '{
+  "name": "展柜H3-无证书", "start_at": "2026-10-01T00:00:00Z", "end_at": "2026-10-01T00:05:00Z",
+  "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 120
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api POST /api/v1/handover-orders "{\"handover_no\":\"HJ-X4\",\"window_ids\":[$H3]}" || true
+echo "整单不留记录（HJ-X4 查询应为 404）："
+api GET /api/v1/handover-orders/HJ-X4 || true
+
+echo "-- 17.5 撤销被引用证书后查询：登记明细保留，整单标为失效 --"
+api POST "/api/v1/certificates/$HC1/revocation" '{"reason":"签发依据有误：r-2 为误采"}' >/dev/null
+api GET /api/v1/handover-orders/$HNO | python3 -m json.tool
+
+echo "-- 17.6 失效后同集合重放仍返回原单（当前状态=失效）；后续再签发不恢复原单 --"
+api POST /api/v1/handover-orders "{\"handover_no\":\"$HNO\",\"window_ids\":[$H1,$H2]}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'status:',d['order']['status'],d['order']['status_label_zh'])"
+api POST "/api/v1/windows/$H1/certificates/issue" '{"note":"撤销后重签"}' >/dev/null
+api GET /api/v1/handover-orders/$HNO \
+  | python3 -c "import sys,json;o=json.load(sys.stdin);print('再签发后 status:',o['status']);print('明细仍固化:',[(i['certificate_id'],i['certificate_version'],i['verdict']) for i in o['items']])"
